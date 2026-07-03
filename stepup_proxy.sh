@@ -44,16 +44,28 @@ die(){ red "错误：$*"; exit 1; }
 
 require_root(){ [ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo bash $0"; }
 
+# 探测某个 systemd 服务的运行用户/组（读不到则用默认值），用于跨发行版正确设置属主
+svc_user(){  # $1=服务文件名 $2=默认用户
+  local u
+  u="$(grep -shE '^[[:space:]]*User[[:space:]]*=' "/etc/systemd/system/$1" 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+  printf '%s' "${u:-$2}"
+}
+svc_group(){ id -gn "$1" 2>/dev/null || printf '%s' "$1"; }  # 该用户的主组名（RHEL=nobody, Debian=nogroup）
+
+pkg_install(){  # 跨发行版安装
+  if   command -v apt-get >/dev/null; then apt-get update -y >/dev/null 2>&1; apt-get install -y "$@"
+  elif command -v dnf     >/dev/null; then dnf install -y "$@"
+  elif command -v yum     >/dev/null; then yum install -y "$@"
+  else red "未识别的包管理器，请手动安装：$*"; return 1; fi
+}
+
 install_deps(){
   local need=()
-  command -v jq >/dev/null    || need+=(jq)
+  command -v jq >/dev/null      || need+=(jq)
   command -v openssl >/dev/null || need+=(openssl)
-  command -v curl >/dev/null   || need+=(curl)
-  if [ "${#need[@]}" -gt 0 ]; then
-    ylw "安装依赖：${need[*]}"
-    apt-get update -y && apt-get install -y "${need[@]}"
-  fi
-  command -v qrencode >/dev/null || apt-get install -y qrencode >/dev/null 2>&1 || true
+  command -v curl >/dev/null    || need+=(curl)
+  if [ "${#need[@]}" -gt 0 ]; then ylw "安装依赖：${need[*]}"; pkg_install "${need[@]}"; fi
+  command -v qrencode >/dev/null || pkg_install qrencode >/dev/null 2>&1 || true
 }
 
 detect_ip(){
@@ -139,7 +151,16 @@ xray_put_inbound(){
      "$XRAY_CONFIG" > "$tmp" && mv "$tmp" "$XRAY_CONFIG"
 }
 
+# 修正 config.json 属主与权限：mktemp+mv 会遗留 0600 root:root，导致以 nobody 运行的服务读不到
+xray_fix_perms(){
+  local u g; u="$(svc_user xray.service nobody)"; g="$(svc_group "$u")"
+  chmod 755 "$(dirname "$XRAY_CONFIG")" 2>/dev/null || true   # 保证服务用户可遍历目录
+  chown "$u:$g" "$XRAY_CONFIG" 2>/dev/null || true            # 属主=服务用户
+  chmod 600 "$XRAY_CONFIG" 2>/dev/null || true                # 仅属主可读，REALITY 私钥不外泄
+}
+
 xray_validate_restart(){
+  xray_fix_perms
   xray run -test -config "$XRAY_CONFIG" || die "Xray 配置校验失败，已保留备份，请检查"
   systemctl restart xray
   systemctl --no-pager -l status xray | head -n 5 || true
@@ -232,7 +253,8 @@ setup_xhttp_cdn(){
   mkdir -p "$XRAY_CERT_DIR"
   install -m644 "$cpath" "${XRAY_CERT_DIR}/${CDN_DOMAIN}.pem"
   install -m600 "$kpath" "${XRAY_CERT_DIR}/${CDN_DOMAIN}.key"
-  chown -R nobody:nogroup "$XRAY_CERT_DIR" 2>/dev/null || true
+  local _cu _cg; _cu="$(svc_user xray.service nobody)"; _cg="$(svc_group "$_cu")"
+  chown -R "$_cu:$_cg" "$XRAY_CERT_DIR" 2>/dev/null || true
 
   local nb; nb="$(cat <<EOF
 {
@@ -283,7 +305,8 @@ setup_hysteria(){
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
       -keyout "$HY_KEY" -out "$HY_CERT" -subj "/CN=${HY_MASQ}" -days 36500
   fi
-  chown hysteria:hysteria "$HY_CERT" "$HY_KEY" 2>/dev/null || true
+  local _hu _hg; _hu="$(svc_user hysteria-server.service hysteria)"; _hg="$(svc_group "$_hu")"
+  chown "$_hu:$_hg" "$HY_CERT" "$HY_KEY" 2>/dev/null || true
   chmod 600 "$HY_KEY"; chmod 644 "$HY_CERT"
 
   # 关键：不写 bandwidth（由客户端触发 Brutal）
