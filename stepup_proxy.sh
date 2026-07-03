@@ -101,9 +101,8 @@ ensure_common_creds(){
 # ----------------------------- Xray 配置管理 -----------------------------
 ensure_xray_config(){
   mkdir -p "$(dirname "$XRAY_CONFIG")"
-  if [ -f "$XRAY_CONFIG" ]; then
-    cp -a "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"   # 每次改前备份
-  else
+  # 文件缺失、为空或非合法 JSON：用干净骨架初始化
+  if [ ! -s "$XRAY_CONFIG" ] || ! jq -e . "$XRAY_CONFIG" >/dev/null 2>&1; then
     cat > "$XRAY_CONFIG" <<'EOF'
 {
   "log": { "loglevel": "warning" },
@@ -111,7 +110,16 @@ ensure_xray_config(){
   "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
 }
 EOF
+    return 0
   fi
+  # 已是合法 JSON（可能是安装器写入的默认配置，缺 inbounds 数组）：备份后规整为数组
+  cp -a "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+  local tmp; tmp="$(mktemp)"
+  jq '.log = (.log // {"loglevel":"warning"})
+      | .inbounds  = (if (.inbounds|type)  == "array" then .inbounds else [] end)
+      | .outbounds = (if (.outbounds|type) == "array" and ((.outbounds|length) > 0)
+                      then .outbounds else [ {"protocol":"freedom","tag":"direct"} ] end)' \
+     "$XRAY_CONFIG" > "$tmp" && mv "$tmp" "$XRAY_CONFIG"
 }
 
 # 按 tag 幂等地增/替换一个 inbound；其它 tag 的入站原样保留
@@ -120,14 +128,14 @@ xray_put_inbound(){
   # 端口占用检查：若同端口被“别的 tag”占用则提示
   local port; port="$(printf '%s' "$nb" | jq -r '.port')"
   local clash; clash="$(jq -r --arg t "$tag" --argjson p "$port" \
-      '[.inbounds[] | select(.port==$p and .tag!=$t) | .tag] | join(",")' "$XRAY_CONFIG")"
+      '[ (.inbounds // [])[] | select(.port==$p and .tag!=$t) | .tag ] | join(",")' "$XRAY_CONFIG")"
   if [ -n "$clash" ]; then
     ylw "注意：端口 ${port} 已被入站「${clash}」占用，继续将与之共存/冲突。"
     read -rp "仍要继续？[y/N]： " a; [ "${a:-N}" = "y" ] || return 1
   fi
   tmp="$(mktemp)"
   jq --arg tag "$tag" --argjson nb "$nb" \
-     '.inbounds = ([.inbounds[] | select(.tag != $tag)] + [$nb])' \
+     '.inbounds = ([ (.inbounds // [])[] | select(.tag != $tag) ] + [$nb])' \
      "$XRAY_CONFIG" > "$tmp" && mv "$tmp" "$XRAY_CONFIG"
 }
 
